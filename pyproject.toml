@@ -59,6 +59,11 @@ write_to = "zoidberg/_version.py"
 git_describe_command = "git describe --dirty --tags --first-parent"
 
 
+[tool.pytest.ini_options]
+markers = [
+    "ai_generated: test written by an AI assistant (Claude)",
+]
+
 [tool.setuptools.packages.find]
 include = ["zoidberg*"]  # alternatively: `exclude = ["additional*"]`
 namespaces = false
