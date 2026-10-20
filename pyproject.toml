@@ -45,7 +45,7 @@ Tracker = "https://github.com/boutproject/zoidberg/issues"
 
 [project.optional-dependencies]
 tests = [
-    "pytest >= 3.3.0",
+    "pytest >= 6.0",
     "xarray",
     "shapely",
 ]
