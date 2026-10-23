@@ -1075,6 +1075,8 @@ def grid_inverse_harmonic(
     eps=1e-4,
     max_refine=1,
     curvature_weight=0.0,
+    orthogonal=0.0,
+    orthogonal_limit=4.0,
     continuation=True,
     continuation_modes=8,
     linear_solver="auto",
@@ -1136,6 +1138,24 @@ def grid_inverse_harmonic(
     solve repeated. For narrow features, `curvature_weight` puts more
     boundary points where the lines are strongly curved.
 
+    With equally spaced boundary points, the grid is strongly sheared
+    where the two lines differ in shape, e.g. opposite a divertor leg: the
+    lines of constant t have to fan out into the leg, and all others tilt
+    towards it. With `orthogonal`, the boundary points are moved along the
+    lines, so that points with the same t are connected by the gradient
+    lines of the solution u of Laplace's equation with u = 0 and 1 on the
+    lines, which are orthogonal to the lines of constant u. These follow
+    from the conformal angle, the harmonic conjugate of u, which is
+    computed on the grid found first; the grid is then solved again with
+    the new boundary points. Along the gradient lines, the points are
+    spaced by the mean of the spacing on both lines, and the change of the
+    point density on each line is limited by `orthogonal_limit`. This makes
+    the grid lines nearly, but not exactly orthogonal, as the spacing along
+    the gradient lines and the cell-size control change the map inside.
+    The price is less uniform cells: points move away from where the lines
+    are far apart (a leg gets fewer points) and crowd on the other line
+    opposite of it.
+
     Parameters
     ----------
     inner, outer : `RZline`
@@ -1188,6 +1208,18 @@ def grid_inverse_harmonic(
         (at most 10), where kappa is the curvature and kappa_ref that of a
         circle with the same perimeter. Useful to resolve narrow features
         such as the tip of a slot (closed divertor), e.g. with 0.05.
+    orthogonal : float, optional
+        Strength of the orthogonality correction of the boundary points,
+        between 0 (off) and 1 (full). If the grid cannot be found with the
+        full correction, it is halved, at most twice, with a warning. The
+        correction about doubles the run time.
+    orthogonal_limit : float, optional
+        With `orthogonal`, the point density on each line changes at most by
+        this factor (> 1): the spacing stays between 1 / orthogonal_limit
+        and orthogonal_limit times the spacing without correction. Smaller
+        values give more uniform cells, but less orthogonal grid lines.
+        Points crowded on a line make points extrapolated beyond it
+        (nx_inner, nx_outer) more likely to fold.
     continuation : bool, optional
         If no valid grid is found directly, solve for a smoothed outer line
         first and morph it step by step into the given outer line, starting
@@ -1257,6 +1289,8 @@ def grid_inverse_harmonic(
     check(eps > 0, "eps must be positive")
     check(curvature_weight >= 0, "curvature_weight must not be negative")
     check(continuation_modes > 0, "continuation_modes must be positive")
+    check(0 <= orthogonal <= 1, "orthogonal must be between 0 and 1")
+    check(orthogonal_limit > 1, "orthogonal_limit must be larger than 1")
     check(
         linear_solver in ("auto", "pardiso", "superlu"),
         'linear_solver must be "auto", "pardiso" or "superlu"',
@@ -1369,6 +1403,10 @@ def grid_inverse_harmonic(
         corr = np.fft.ifft(np.fft.fft(zin) * np.conj(np.fft.fft(zout)))
         shift = np.argmax(np.real(corr)) / nsample
 
+    # Line parameters of the boundary points as functions of t, for the
+    # inner and the outer line. Replaced by `orthogonalize`.
+    theta_of = [lambda v: inner_theta(v + shift), outer_theta]
+
     # Normalise coordinates to unit area, so that eps is scale invariant
     centre = np.mean(outer.R) + 1j * np.mean(outer.Z)
     scale = np.sqrt(polygons[1].area - polygons[0].area)
@@ -1378,6 +1416,16 @@ def grid_inverse_harmonic(
     gauss_x = 0.5 * (gauss_x + 1)
     gauss_w = 0.5 * gauss_w
     nq = p + 1
+
+    def set_boundary(S):
+        """Boundary rows of the control net, which interpolate the lines"""
+        S.boundary = np.empty((2, 2, S.nt))
+        for i, line in enumerate((inner, outer)):
+            th = theta_of[i](S.centres)
+            pos = (line.Rvalue(th) + 1j * line.Zvalue(th) - centre) / scale
+            coef = np.linalg.solve(S.colloc_t, pos)
+            S.boundary[0, i] = coef.real
+            S.boundary[1, i] = coef.imag
 
     def make_space(nex, nt):
         """Spline space with nex elements in x and nt periodic functions in t"""
@@ -1424,16 +1472,7 @@ def grid_inverse_harmonic(
         S.colloc_x = clamped_matrix(S.knots, S.greville)
         S.colloc_t = periodic_matrix(S.centres, nt)
 
-        # Boundary rows of the control net interpolate the boundaries
-        S.boundary = np.empty((2, 2, nt))
-        for i, (line, theta_of) in enumerate(
-            ((inner, lambda v: inner_theta(v + shift)), (outer, outer_theta))
-        ):
-            th = theta_of(S.centres)
-            pos = (line.Rvalue(th) + 1j * line.Zvalue(th) - centre) / scale
-            coef = np.linalg.solve(S.colloc_t, pos)
-            S.boundary[0, i] = coef.real
-            S.boundary[1, i] = coef.imag
+        set_boundary(S)
 
         # Products of basis function derivatives at the quadrature points,
         # which only depend on the element row. With these, element matrices
@@ -1996,7 +2035,7 @@ def grid_inverse_harmonic(
         # smoothed line (where a slot was removed), the fallback is the
         # smoothed line's own spacing, shifted along it so that on average
         # the points are where those on the given line are.
-        given = outer_theta(S.centres)
+        given = theta_of[1](S.centres)
         phase = 0.0
         for _ in range(4):
             phase -= np.mean(smoothed_theta(S.centres + phase) - given) / (2 * pi)
@@ -2072,6 +2111,189 @@ def grid_inverse_harmonic(
             )
         return C, converged, mindet, True
 
+    def periodic_eval(S, coef, t, deriv=0):
+        """Periodic spline with coefficients coef[..., nt] (or its
+        derivative) at the points t, using the p + 1 nonzero functions"""
+        t = np.asarray(t, dtype=float)
+        low = np.ceil(S.nt * t - (p + 1) / 2).astype(int)
+        out = 0.0
+        for k in range(p + 1):
+            j = low + k
+            s_ = S.nt * t - j + (p + 1) / 2
+            out = out + coef[..., j % S.nt] * (cardinal(s_, deriv) * S.nt**deriv)
+        return out
+
+    def conformal_angle(S, C):
+        """Conformal angle of the domain on the map C: v = t + w(x, t), where
+        w is periodic. v is harmonic in the physical domain and its normal
+        derivative vanishes on both lines, i.e. it is the harmonic conjugate
+        of the solution u of Laplace's equation with u = 0 and 1 on the lines
+        (scaled to a period of 1). Lines of constant v are orthogonal to the
+        lines of constant u. Weak form in the parameter domain with the
+        pulled back Laplacian adj(J^T J) / det J. Returns the coefficients
+        of w, shape (nr, nt)."""
+
+        def assemble_rows(exs):
+            G = stencil(S, 1)
+            rhs = np.zeros((1, S.ndof))
+            J = evaluate(S, C, exs, ((1, 0), (0, 1)))
+            A11, A12, A22 = metric_A(J)
+            det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+            K = np.array([[A11, A12], [A12, A22]]) / det * S.weights
+            grads = (tensor(S, exs, 1, 0), tensor(S, exs, 0, 1))
+            idx = element_indices(S, exs)
+            # grad t = (0, 1): the right hand side is -K[:, 1] . grad(phi)
+            np.add.at(rhs[0], idx, -sum(K[b, 1] @ grads[b] for b in range(2)))
+            coefficients = np.moveaxis(K, (0, 1), (2, 3))
+            local = element_matrices(
+                S.products_weak[exs], coefficients.reshape(*det.shape[:2], 4, -1)
+            )
+            add_local(S, G[0, 0], exs, local)
+            return rhs, G, np.amin(det)
+
+        rhs, G, _ = assemble_chunks(assemble_rows, S)
+        rows = np.arange(1, S.ndof)  # w is defined up to a constant
+        K = sparse(S, "conformal", G, rows, rows)
+        w = np.zeros(S.ndof)
+        w[rows] = get_solver(S, "conformal")(K, rhs[0][rows])
+        # Only needed once: release the factorisation
+        S.solvers.pop("conformal").release()
+        return w.reshape(S.nr, S.nt)
+
+    def orthogonal_correspondence(S, W, strength):
+        """New boundary correspondence from the conformal angle v = t + w
+        (coefficients W of w). Returns tau, where tau[i](t_new) is the old t
+        of the point of line i (0 inner, 1 outer) which gets the new
+        parameter t_new, or None if it is not monotone.
+
+        Points are matched along the lines of constant v, which are
+        orthogonal to the lines of constant u. Along them, the points are
+        distributed by the mean of the old parameters of both lines (the arc
+        length fractions, weighted by the curvature with curvature_weight),
+        so that the spacing on each line is at most twice its old spacing.
+        The density of points on each line is then limited to
+        [1 / orthogonal_limit, orthogonal_limit] times the old density, by
+        clipping it and spreading the excess to the neighbouring points, and
+        then smoothed. This moves points only locally, so the matching is lost only near
+        features where the lines differ strongly (e.g. a divertor leg)."""
+        nf = 32 * S.nt
+        tf = np.arange(nf) / nf
+        v = []
+        for row in (0, -1):
+            # dv/dt is the normal derivative of u, which is positive but can be
+            # exponentially small in protrusions of the domain, where the
+            # discrete value can have the wrong sign. It is limited from below,
+            # and v integrated again.
+            dv = np.maximum(1 + periodic_eval(S, W[row], tf, 1), 1e-6)
+            vi = np.concatenate(([0.0], np.cumsum(0.5 * (dv + np.roll(dv, -1)))))
+            vi = vi[:-1] / vi[-1]
+            v.append(vi + np.mean(tf + periodic_eval(S, W[row], tf) - vi))
+
+        def old_t_at(i, vv):
+            """Old parameter of the point of line i with conformal angle vv"""
+            ve = np.concatenate((v[i] - 1, v[i], v[i] + 1))
+            return np.interp(vv, ve, np.concatenate((tf - 1, tf, tf + 1)))
+
+        k = np.fft.fftfreq(nf, 1.0 / nf)
+        # Width of one cell, at least 1/256 of the line
+        kernel = np.exp(-0.5 * (2 * pi * k * max(1.0 / S.nt, 1.0 / 256)) ** 2)
+        lo, hi = 1 / orthogonal_limit, orthogonal_limit
+        T = [0.5 * (old_t_at(0, v[i]) + old_t_at(1, v[i])) for i in range(2)]
+        offset = np.mean(T[0] - tf)
+        tau = []
+        for i in range(2):
+            Ti = (1 - strength) * tf + strength * (T[i] - offset)
+            d = np.diff(np.append(Ti, Ti[0] + 1)) * nf  # Density relative to old
+            for _ in range(20 * S.nt):
+                clipped = np.clip(d, lo, hi)
+                excess = d - clipped
+                if np.amax(np.abs(excess)) < 1e-6:
+                    break
+                d = clipped + np.real(np.fft.ifft(np.fft.fft(excess) * kernel))
+            # The clipping leaves kinks in the spacing, i.e. jumps of the
+            # metric coefficients along the lines. Smooth them with a positive
+            # kernel, which keeps the bounds, over at least two cells and
+            # 1/128 of the line, so that the density does not depend on the
+            # resolution for nz >= 256 and the metric converges.
+            width = max(2.0 / S.nt, 1.0 / 128)
+            d = np.clip(d, lo, hi)
+            d = np.real(
+                np.fft.ifft(np.fft.fft(d) * np.exp(-0.5 * (2 * pi * k * width) ** 2))
+            )
+            d /= np.mean(d)
+            Tn = np.concatenate(([0.0], np.cumsum(d[:-1]))) / nf
+            Ti = Tn + np.mean(Ti - Tn)  # Keep the phase of the line
+            if np.amin(np.diff(Ti)) <= 0:
+                return None
+            # tau(t_new) - t_new is periodic
+            tau.append(
+                lambda tn, Ti=Ti: (
+                    np.asarray(tn) + np.interp(np.asarray(tn), Ti, tf - Ti, period=1.0)
+                )
+            )
+        return tau
+
+    def orthogonalize(S, C, converged, mindet):
+        """Move the boundary points along the lines to the orthogonal
+        correspondence, then solve again. The initial guess is the old map
+        composed with the reparametrisation (x, t) -> (x, tau(x, t)), with tau
+        interpolated linearly in x, and corrected linearly in x to the new
+        boundary rows. If Newton's method does not give a valid map, the
+        full solve (with continuation) is tried, then the strength halved
+        (at most twice). If all fails, the uncorrected map is kept."""
+        W = conformal_angle(S, C)
+        old_theta = list(theta_of)
+        strength = orthogonal
+        for attempt in range(3):
+            tau = orthogonal_correspondence(S, W, strength)
+            if tau is not None:
+                moved = max(
+                    np.amax(np.abs(tau[i](S.centres) - S.centres)) for i in range(2)
+                )
+                if moved * S.nt < 1e-3:
+                    # Already orthogonal, e.g. concentric circles
+                    return C, converged, mindet
+                for i in range(2):
+                    theta_of[i] = lambda v, f=old_theta[i], g=tau[i]: f(g(v))
+                set_boundary(S)
+                Cn = np.empty_like(C)
+                for k in range(2):
+                    V = np.empty((S.nr, S.nt))
+                    for i, x in enumerate(S.greville):
+                        t_old = (1 - x) * tau[0](S.centres) + x * tau[1](S.centres)
+                        V[i] = S.colloc_x[i] @ periodic_eval(S, C[k], t_old)
+                    Cn[k] = np.linalg.solve(
+                        S.colloc_t, np.linalg.solve(S.colloc_x, V).T
+                    ).T
+                # The boundary rows of the composed map follow the old spline,
+                # not the lines: correct them, spreading the change in x
+                g = S.greville[None, :, None]
+                Cn += (1 - g) * (S.boundary[:, 0] - Cn[:, 0])[:, None, :]
+                Cn += g * (S.boundary[:, 1] - Cn[:, -1])[:, None, :]
+                Cn, conv = weak_solve(S, Cn)
+                md = min_det(S, Cn)
+                if md <= 0 or not conv:
+                    Cn, conv, md = solve(S)
+                if verbose:
+                    print(
+                        f"  orthogonal (strength {strength:g}): converged={conv}, "
+                        f"min det J {md:.3e}"
+                    )
+                if md > 0 and (conv or not converged):
+                    if strength < orthogonal:
+                        warnings.warn(
+                            "grid_inverse_harmonic: orthogonal correction reduced "
+                            f"to {strength:g}"
+                        )
+                    return Cn, conv, md
+                theta_of[:] = old_theta
+                set_boundary(S)
+            strength /= 2
+        warnings.warn(
+            "grid_inverse_harmonic: orthogonal correction failed, it is not applied"
+        )
+        return C, converged, mindet
+
     def solve(S):
         """Fixed point iteration for the initial guess, then Newton on the
         weak form. Should Newton fail, retry with continuation in the
@@ -2108,6 +2330,8 @@ def grid_inverse_harmonic(
         S = make_space(2**refine * resolution * (nx - 1), 2**refine * resolution * nz)
         try:
             C, converged, mindet = solve(S)
+            if orthogonal and mindet > 0:
+                C, converged, mindet = orthogonalize(S, C, converged, mindet)
         finally:
             for linsolve in S.solvers.values():
                 linsolve.release()

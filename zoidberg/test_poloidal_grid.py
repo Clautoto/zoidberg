@@ -181,19 +181,27 @@ def test_inverse_harmonic_smooth_metric():
     # Strongly triangular D shape. The metric is smooth almost everywhere;
     # close to the sharp tips of the outer boundary it changes quickly over
     # the last few cells, which limits the largest second difference.
+    # The same holds with the orthogonality correction, which moves the
+    # points along the lines, also for the spacing along the inner line.
     inner = rzline.shaped_line(R0=3.0, a=0.3, n=100)
     outer = rzline.shaped_line(R0=3.0, a=1.2, elong=1.0, triang=0.9, n=300)
-    previous = None
-    for nx, nz in ((17, 64), (33, 128)):
-        R, Z = poloidal_grid.grid_inverse_harmonic(
-            inner, outer, nx, nz, return_coords=True
-        )
-        d2 = metric_second_differences(R, Z)
-        assert np.percentile(d2, 99) < 0.15 and np.amax(d2) < 0.5
-        if previous is not None:
-            # Smooth metric: second differences decrease under refinement
-            assert np.percentile(d2, 99) < 0.5 * previous
-        previous = np.percentile(d2, 99)
+    for orthogonal in (0.0, 1.0):
+        previous = None
+        for nx, nz in ((17, 64), (33, 128)):
+            R, Z = poloidal_grid.grid_inverse_harmonic(
+                inner, outer, nx, nz, return_coords=True, orthogonal=orthogonal
+            )
+            d2 = metric_second_differences(R, Z)
+            assert np.percentile(d2, 99) < 0.15 and np.amax(d2) < 0.5
+            if previous is not None:
+                # Smooth metric: second differences decrease under refinement
+                assert np.percentile(d2, 99) < 0.5 * previous
+            previous = np.percentile(d2, 99)
+            gzz = (np.roll(R[0], -1) - np.roll(R[0], 1)) ** 2 + (
+                np.roll(Z[0], -1) - np.roll(Z[0], 1)
+            ) ** 2
+            d2_inner = np.abs(np.roll(gzz, -1) - 2 * gzz + np.roll(gzz, 1)) / gzz
+            assert np.amax(d2_inner) < 0.15
 
 
 def test_inverse_harmonic_invalid_input():
@@ -339,3 +347,84 @@ def test_inverse_harmonic_curvature_weight():
         tips = np.abs(R[-1] - 3.0) > 1.3
         ratio.append(spacing[tips].mean() / spacing[~tips].mean())
     assert ratio[1] < 0.6 * ratio[0]
+
+
+def grid_angles(R, Z):
+    """Angle between the grid lines in degrees, 90 is orthogonal"""
+    Rx, Zx = np.gradient(R, axis=0), np.gradient(Z, axis=0)
+    Rz = 0.5 * (np.roll(R, -1, axis=1) - np.roll(R, 1, axis=1))
+    Zz = 0.5 * (np.roll(Z, -1, axis=1) - np.roll(Z, 1, axis=1))
+    cos = np.abs(Rx * Rz + Zx * Zz) / np.hypot(Rx, Zx) / np.hypot(Rz, Zz)
+    return np.degrees(np.arccos(np.minimum(cos, 1.0)))
+
+
+def test_inverse_harmonic_orthogonal_noop():
+    # Concentric circles are orthogonal already: the correction does nothing
+    inner = rzline.circle(R0=3.0, r=0.5, n=100)
+    outer = rzline.circle(R0=3.0, r=1.5, n=100)
+    R0, Z0 = poloidal_grid.grid_inverse_harmonic(
+        inner, outer, 9, 32, return_coords=True
+    )
+    R, Z = poloidal_grid.grid_inverse_harmonic(
+        inner, outer, 9, 32, return_coords=True, orthogonal=1.0
+    )
+    assert np.allclose(R, R0) and np.allclose(Z, Z0)
+
+
+def test_inverse_harmonic_orthogonal():
+    # Eccentric circles: equally spaced points on both lines give sheared
+    # cells, the orthogonality correction removes most of the shear
+    inner = rzline.circle(R0=3.4, r=0.5, n=100)
+    outer = rzline.circle(R0=3.0, r=1.5, n=100)
+    angles = []
+    for orthogonal in (0.0, 1.0):
+        R, Z = poloidal_grid.grid_inverse_harmonic(
+            inner, outer, 12, 64, return_coords=True, orthogonal=orthogonal
+        )
+        assert np.amin(fd_jacobian(R, Z)) > 0
+        angles.append(grid_angles(R, Z))
+    assert np.median(angles[0]) < 80
+    assert np.median(angles[1]) > 87
+    assert np.amin(angles[1]) > np.amin(angles[0]) + 10
+    # The boundary points still lie on the lines
+    for line, r, z in ((inner, R[0], Z[0]), (outer, R[-1], Z[-1])):
+        theta = np.linspace(0, 2 * np.pi, 200000, endpoint=False)
+        ring = shapely.LinearRing(np.column_stack(line.position(theta)))
+        distance = shapely.distance(ring, shapely.points(np.column_stack([r, z])))
+        assert np.amax(distance) < 1e-8
+
+
+def test_inverse_harmonic_orthogonal_limit():
+    # The spacing of the points on the lines changes at most by the limit
+    inner = rzline.circle(R0=3.4, r=0.5, n=100)
+    outer = rzline.circle(R0=3.0, r=1.5, n=100)
+    for limit in (1.25, 4.0):
+        R, Z = poloidal_grid.grid_inverse_harmonic(
+            inner,
+            outer,
+            12,
+            64,
+            return_coords=True,
+            orthogonal=1.0,
+            orthogonal_limit=limit,
+        )
+        for row in (0, -1):
+            spacing = np.hypot(
+                np.diff(R[row], append=R[row, 0]), np.diff(Z[row], append=Z[row, 0])
+            )
+            ratio = spacing / spacing.mean()
+            assert np.amax(ratio) < 1.02 * limit and np.amin(ratio) > 0.98 / limit
+    # The default limit does not reduce the correction here
+    assert np.median(grid_angles(R, Z)) > 87
+
+
+def test_inverse_harmonic_orthogonal_invalid():
+    inner = rzline.circle(R0=3.0, r=0.5, n=50)
+    outer = rzline.circle(R0=3.0, r=1.5, n=50)
+    for options in (
+        {"orthogonal": -0.5},
+        {"orthogonal": 1.5},
+        {"orthogonal_limit": 1.0},
+    ):
+        with pytest.raises(ValueError):
+            poloidal_grid.grid_inverse_harmonic(inner, outer, 9, 16, **options)
